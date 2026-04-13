@@ -1,64 +1,23 @@
 use clap::Parser;
-use std::collections::HashMap;
-use std::io::{Read, Write};
+use enterthevoid::ipc::{IpcRequest, IpcResponse, receive_message, send_message};
+use enterthevoid::mmu::Mmu;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::thread;
 
+/// Command line arguments for the Kernel simulator.
 #[derive(Parser)]
 struct Args {
+    /// Enables vulnerable syscalls.
     #[arg(long)]
     vulnerable: bool,
+    /// Allows logical mapping to page zero.
     #[arg(long)]
     allow_page_zero: bool,
 }
 
-struct PageTableEntry {
-    physical_frame: usize,
-    valid: bool,
-}
-
-struct MMU {
-    arena: Vec<u8>, // 64 KB de "RAM Física"
-    page_table: HashMap<usize, PageTableEntry>,
-}
-
-impl MMU {
-    fn new() -> Self {
-        Self {
-            arena: vec![0; 64 * 1024],
-            page_table: HashMap::new(),
-        }
-    }
-
-    fn translate(&self, logical_addr: usize) -> Option<usize> {
-        let page_num = logical_addr / 4096;
-        let offset = logical_addr % 4096;
-
-        match self.page_table.get(&page_num) {
-            Some(entry) if entry.valid => {
-                let phys_addr = entry.physical_frame + offset;
-
-                let value = self.arena.get(phys_addr).cloned().unwrap_or(0);
-
-                println!(
-                    " [KERNEL] MMU Read: Logic addr 0x{:X} -> Physical addr 0x{:X} (Value : 0x{:02X})",
-                    logical_addr, phys_addr, value
-                );
-
-                Some(phys_addr)
-            }
-            _ => {
-                println!(
-                    " [KERNEL] MMU Error: Page Fault at Logic addr 0x{:X} (Not Mapped)",
-                    logical_addr
-                );
-                None
-            }
-        }
-    }
-}
-
+/// Holds the execution context and privileges for a connected session.
 struct KernelState {
-    mmu: MMU,
+    mmu: Mmu,
     user_privileged: bool,
     user_name: String,
 }
@@ -66,30 +25,45 @@ struct KernelState {
 fn main() {
     let args = Args::parse();
     let socket_path = "/tmp/rust_os_sim.sock";
+
+    // Clean up previous socket if it exists
     let _ = std::fs::remove_file(socket_path);
 
-    let listener = UnixListener::bind(socket_path).unwrap();
+    let listener = UnixListener::bind(socket_path).expect("Failed to bind to socket");
     println!(" [KERNEL] Waiting for user login...");
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                handle_client(&mut stream, &args);
+                // Spawn a new thread for each client to handle multiple simultaneous connections
+                let args_clone = Args {
+                    vulnerable: args.vulnerable,
+                    allow_page_zero: args.allow_page_zero,
+                };
+                thread::spawn(move || {
+                    handle_client(&mut stream, &args_clone);
+                });
             }
-            Err(e) => println!("Error: {}", e),
+            Err(e) => eprintln!(" [KERNEL] Connection Error: {}", e),
         }
     }
 }
 
+/// Main loop for handling IPC requests from a connected client.
 fn handle_client(stream: &mut UnixStream, args: &Args) {
-    let mut buffer = [0; 1024];
-    let n = stream.read(&mut buffer).unwrap();
-    let name = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+    let mut buffer = [0; 2048];
 
-    let mut state = KernelState {
-        mmu: MMU::new(),
-        user_privileged: false,
-        user_name: name,
+    // Initial handshake / login
+    let mut state = match receive_message::<IpcRequest>(stream, &mut buffer) {
+        Ok(Some(IpcRequest::Login { username })) => KernelState {
+            mmu: Mmu::new(),
+            user_privileged: false,
+            user_name: username,
+        },
+        _ => {
+            eprintln!(" [KERNEL] Invalid login sequence. Closing connection.");
+            return;
+        }
     };
 
     println!(
@@ -98,121 +72,103 @@ fn handle_client(stream: &mut UnixStream, args: &Args) {
     );
 
     loop {
-        let n = match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        let request = String::from_utf8_lossy(&buffer[..n]);
-        let cmd: Vec<&str> = request.split_whitespace().collect();
-        if cmd.is_empty() {
-            continue;
-        }
-
-        match cmd[0] {
-            "WRITE_LOGICAL" => {
-                if let (Some(addr_str), Some(val_str)) = (cmd.get(1), cmd.get(2)) {
-                    let logical_addr: usize = addr_str.parse().unwrap_or(0);
-
-                    let value: u8 = if let Some(hex_val) = val_str.strip_prefix("0x") {
-                        u8::from_str_radix(hex_val, 16).unwrap_or(0)
-                    } else {
-                        val_str.parse().unwrap_or(0)
-                    };
-
-                    if let Some(phys_addr) = state.mmu.translate(logical_addr) {
-                        state.mmu.arena[phys_addr] = value;
-                        let _ = stream.write_all(b"OK: Write Successful");
-                    } else {
-                        let _ = stream.write_all(b"ERROR: Page Fault on Write");
-                    }
-                }
+        match receive_message::<IpcRequest>(stream, &mut buffer) {
+            Ok(Some(request)) => process_request(stream, &mut state, args, request),
+            Ok(None) => {
+                println!(" [KERNEL] User {} disconnected.", state.user_name);
+                break;
             }
-            "READ_LOGICAL" => {
-                if let Some(addr_str) = cmd.get(1) {
-                    let logical_addr: usize = addr_str.parse().unwrap_or(0);
-
-                    if let Some(phys_addr) = state.mmu.translate(logical_addr) {
-                        let value = state.mmu.arena[phys_addr];
-
-                        let respuesta = format!("VALUE: 0x{:02X}\n", value);
-                        let _ = stream.write_all(respuesta.as_bytes());
-                    } else {
-                        let _ = stream.write_all(b"ERROR: Page Fault on Read\n");
-                    }
-                }
-            }
-
-            "MMAP_LOGICAL" => {
-                let addr: usize = cmd[1].parse().unwrap();
-                let page_num = addr / 4096;
-
-                if addr == 0 && !args.allow_page_zero {
-                    let _ =
-                        stream.write_all(b"ERROR: Security Policy - Page Zero mapping forbidden");
-                } else {
-                    state.mmu.page_table.insert(
-                        page_num,
-                        PageTableEntry {
-                            physical_frame: page_num * 4096,
-                            valid: true,
-                        },
-                    );
-                    println!(" [KERNEL] MMU: Page {} mapped.", page_num);
-                    let _ = stream.write_all(b"OK: Mapped");
-                }
-            }
-
-            "MAKE_ROOT" => {
-                if state.user_privileged {
-                    println!(
-                        " [KERNEL] User {} already has root privilegs.",
-                        state.user_name
-                    );
-                    let _ = stream.write_all(b"OK: You are root.\n");
-                } else {
-                    println!(
-                        " [SECURITY_ALERT] Unautorized privilege escalation attempt via MAKE_ROOT by user: {}",
-                        state.user_name
-                    );
-                    let _ = stream.write_all(b"ERROR: Unauthorized. (PSW.mode == 0)\n");
-                }
-            }
-
-            "SYS_VULN" => {
-                if args.vulnerable {
-                    if let Some(phys_addr) = state.mmu.translate(0) {
-                        let payload_type = state.mmu.arena[phys_addr];
-
-                        if payload_type == 0xCC {
-                            // 0xCC simulando un 'opcode' de escalamiento
-                            state.user_privileged = true;
-                            let _ = stream.write_all(b"OK: PRIVILEGE ESCALATION SUCCESSFUL");
-                        } else {
-                            println!(" [KERNEL] Unrecognized instruction {} at 0x0", payload_type);
-                            let _ = stream
-                                .write_all(b"ERROR: Kernel Panic - Invalid Instruction at 0x0");
-                        }
-                    } else {
-                        let _ = stream
-                            .write_all(b"ERROR: Kernel Panic - Segmentation Fault (Simulated)");
-                    }
-                } else {
-                    let _ = stream.write_all(b"ERROR: Unavailable syscall.");
-                }
-            }
-
-            "ECHO_ROOT" => {
-                if state.user_privileged {
-                    println!(" [KERNEL_AUTH_LOG]: {}", cmd[1..].join(" "));
-                    let _ = stream.write_all(b"OK: Message logged as root\n");
-                } else {
-                    println!(" [SECURITY_ALERT]: Unauthorized.");
-                    let _ = stream.write_all(b"ERROR: Unauthorized\n");
-                }
-            }
-            _ => {
-                let _ = stream.write_all(b"ERROR: Unknown command\n");
+            Err(e) => {
+                eprintln!(" [KERNEL] IPC Read Error: {}", e);
+                break;
             }
         }
     }
+}
+
+/// Routes and executes an incoming IPC request.
+fn process_request(
+    stream: &mut UnixStream,
+    state: &mut KernelState,
+    args: &Args,
+    request: IpcRequest,
+) {
+    let response = match request {
+        IpcRequest::Login { .. } => IpcResponse::Error("Already logged in".to_string()),
+
+        IpcRequest::WriteLogical { addr, value } => match state.mmu.write(addr, value) {
+            Ok(_) => IpcResponse::Ok("Write Successful".to_string()),
+            Err(e) => IpcResponse::Error(format!("Page Fault on Write: {}", e)),
+        },
+
+        IpcRequest::ReadLogical { addr } => match state.mmu.read(addr) {
+            Ok(val) => IpcResponse::Value(val),
+            Err(e) => IpcResponse::Error(format!("Page Fault on Read: {}", e)),
+        },
+
+        IpcRequest::MmapLogical { addr } => {
+            if state.mmu.get_page_num(addr) == 0 && !args.allow_page_zero {
+                IpcResponse::Error("Security Policy: Page Zero mapping forbidden".to_string())
+            } else {
+                match state.mmu.map_page(addr) {
+                    Ok(_) => {
+                        println!(" [KERNEL] MMU: Address {} mapped.", addr);
+                        IpcResponse::Ok("Mapped successfully".to_string())
+                    }
+                    Err(e) => IpcResponse::Error(e.to_string()),
+                }
+            }
+        }
+
+        IpcRequest::MakeRoot => {
+            if state.user_privileged {
+                IpcResponse::Ok("You are already root.".to_string())
+            } else {
+                println!(
+                    " [SECURITY_ALERT] Unauthorized privilege escalation attempt by user: {}",
+                    state.user_name
+                );
+                IpcResponse::Error("Unauthorized. (PSW.mode == 0)".to_string())
+            }
+        }
+
+        IpcRequest::SysVuln => {
+            if args.vulnerable {
+                match state.mmu.read(0) {
+                    Ok(0xCC) => {
+                        // 0xCC simulating a privilege escalation shellcode execution
+                        state.user_privileged = true;
+                        IpcResponse::Ok("PRIVILEGE ESCALATION SUCCESSFUL".to_string())
+                    }
+                    Ok(payload) => {
+                        println!(
+                            " [KERNEL] Unrecognized instruction 0x{:02X} at 0x0",
+                            payload
+                        );
+                        IpcResponse::Error("Kernel Panic - Invalid Instruction at 0x0".to_string())
+                    }
+                    Err(_) => IpcResponse::Error(
+                        "Kernel Panic - Segmentation Fault (Simulated)".to_string(),
+                    ),
+                }
+            } else {
+                IpcResponse::Error("Unavailable syscall (Not vulnerable).".to_string())
+            }
+        }
+
+        IpcRequest::EchoRoot { message } => {
+            if state.user_privileged {
+                println!(" [KERNEL_AUTH_LOG]: {}", message);
+                IpcResponse::Ok("Message logged as root".to_string())
+            } else {
+                println!(
+                    " [SECURITY_ALERT] Unauthorized attempt to write to kernel buffer by user: {}",
+                    state.user_name
+                );
+                IpcResponse::Error("Unauthorized".to_string())
+            }
+        }
+    };
+
+    let _ = send_message(stream, &response);
 }

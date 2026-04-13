@@ -1,12 +1,23 @@
-use std::io::{self, Read, Write};
+use enterthevoid::ipc::{IpcRequest, IpcResponse, receive_message, send_message};
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 
-fn enviar_comando(stream: &mut UnixStream, cmd: &str) {
-    let mut mensaje = cmd.to_string();
-    mensaje.push('\n');
-    stream
-        .write_all(mensaje.as_bytes())
-        .expect("Error al escribir en socket");
+/// Parses a string into a number, supporting hex (0x...) or decimal format.
+fn parse_number(input: &str) -> Option<usize> {
+    if let Some(hex_val) = input.strip_prefix("0x") {
+        usize::from_str_radix(hex_val, 16).ok()
+    } else {
+        input.parse().ok()
+    }
+}
+
+/// Parses a string into a byte, supporting hex (0x...) or decimal format.
+fn parse_byte(input: &str) -> Option<u8> {
+    if let Some(hex_val) = input.strip_prefix("0x") {
+        u8::from_str_radix(hex_val, 16).ok()
+    } else {
+        input.parse().ok()
+    }
 }
 
 fn main() {
@@ -14,8 +25,8 @@ fn main() {
     let mut stream = match UnixStream::connect(socket_path) {
         Ok(s) => s,
         Err(_) => {
-            println!(" [!] Error: No se pudo conectar con el kernel (kernel_sim).");
-            println!("     Asegúrate de que el kernel se esté ejecutando primero.");
+            println!(" [!] Error: Could not connect to the kernel (kernel_sim).");
+            println!("     Make sure the kernel is running first.");
             return;
         }
     };
@@ -27,7 +38,14 @@ fn main() {
     let mut user_name = String::new();
     io::stdin().read_line(&mut user_name).unwrap();
 
-    enviar_comando(&mut stream, user_name.trim());
+    // Send login handshake
+    let login_req = IpcRequest::Login {
+        username: user_name.trim().to_string(),
+    };
+    if send_message(&mut stream, &login_req).is_err() {
+        println!(" [!] Error authenticating with the kernel.");
+        return;
+    }
 
     loop {
         print!("> ");
@@ -35,106 +53,134 @@ fn main() {
 
         let mut input = String::new();
         if io::stdin().read_line(&mut input).unwrap() == 0 {
-            break;
-        } // EOF (Ctrl+D)
+            break; // EOF (Ctrl+D)
+        }
 
         let tokens: Vec<&str> = input.split_whitespace().collect();
         if tokens.is_empty() {
             continue;
         }
 
-        let command = tokens[0];
-
-        match command {
-            // --- COMANDOS DE MEMORIA ---
+        let request = match tokens[0] {
             "mmap" => {
-                if let Some(addr) = tokens.get(1) {
-                    enviar_comando(&mut stream, &format!("MMAP_LOGICAL {}", addr));
-                    recibir_respuesta(&mut stream);
+                if let Some(addr_str) = tokens.get(1) {
+                    if let Some(addr) = parse_number(addr_str) {
+                        Some(IpcRequest::MmapLogical { addr })
+                    } else {
+                        println!(" [!] Invalid address.");
+                        None
+                    }
                 } else {
-                    println!(" Uso: mmap <direccion_logica>");
+                    println!(" Usage: mmap <logical_address>");
+                    None
                 }
             }
 
             "write" => {
-                if let (Some(addr), Some(val)) = (tokens.get(1), tokens.get(2)) {
-                    enviar_comando(&mut stream, &format!("WRITE_LOGICAL {} {}", addr, val));
-                    recibir_respuesta(&mut stream);
+                if let (Some(addr_str), Some(val_str)) = (tokens.get(1), tokens.get(2)) {
+                    if let (Some(addr), Some(value)) = (parse_number(addr_str), parse_byte(val_str))
+                    {
+                        Some(IpcRequest::WriteLogical { addr, value })
+                    } else {
+                        println!(" [!] Invalid arguments.");
+                        None
+                    }
                 } else {
-                    println!(" Uso: write <addr> <val>");
+                    println!(" Usage: write <addr> <val> (supports 0x...)");
+                    None
                 }
             }
 
             "read" => {
-                if let Some(addr) = tokens.get(1) {
-                    enviar_comando(&mut stream, &format!("READ_LOGICAL {}", addr));
-                    recibir_respuesta(&mut stream);
+                if let Some(addr_str) = tokens.get(1) {
+                    if let Some(addr) = parse_number(addr_str) {
+                        Some(IpcRequest::ReadLogical { addr })
+                    } else {
+                        println!(" [!] Invalid address.");
+                        None
+                    }
                 } else {
-                    println!(" Uso: read <addr>");
+                    println!(" Usage: read <addr>");
+                    None
                 }
             }
 
-            // --- COMANDOS DE PRIVILEGIOS ---
-            "su" => {
-                enviar_comando(&mut stream, "MAKE_ROOT");
-                recibir_respuesta(&mut stream);
-            }
+            "su" => Some(IpcRequest::MakeRoot),
 
             "echo_root" => {
                 if tokens.len() > 1 {
-                    let mensaje = tokens[1..].join(" ");
-                    enviar_comando(&mut stream, &format!("ECHO_ROOT {}", mensaje));
-                    recibir_respuesta(&mut stream);
+                    Some(IpcRequest::EchoRoot {
+                        message: tokens[1..].join(" "),
+                    })
                 } else {
-                    println!(" Uso: echo_root <mensaje>");
+                    println!(" Usage: echo_root <message>");
+                    None
                 }
             }
 
-            // --- EXPLOIT & VULNERABILIDAD ---
-            "sys_vuln" => {
-                enviar_comando(&mut stream, "SYS_VULN");
-                recibir_respuesta(&mut stream);
-            }
+            "sys_vuln" => Some(IpcRequest::SysVuln),
 
             "exploit" | "exploit.sh" | "pwn.sh" => {
-                realizar_exploit(&mut stream);
+                execute_exploit(&mut stream);
+                None // Exploit handled internally
             }
 
             "exit" | "quit" => break,
 
-            _ => println!(
-                " Unrecognized command. Available: mmap, write, read, su, echo_root, sys_vuln, exploit, exit"
-            ),
+            _ => {
+                println!(
+                    " Unrecognized command. Available: mmap, write, read, su, echo_root, sys_vuln, exploit, exit"
+                );
+                None
+            }
+        };
+
+        if let Some(req) = request {
+            if send_message(&mut stream, &req).is_ok() {
+                receive_response(&mut stream);
+            } else {
+                println!(" [!] Communication error with the kernel.");
+                break;
+            }
         }
     }
 }
 
-fn recibir_respuesta(stream: &mut UnixStream) {
-    let mut buffer = [0; 1024];
-    match stream.read(&mut buffer) {
-        Ok(n) if n > 0 => {
-            let respuesta = String::from_utf8_lossy(&buffer[..n]);
-            println!(" [KERNEL] {}", respuesta);
-        }
-        _ => println!(" [!] Sin respuesta del kernel."),
+/// Waits for and prints the response from the kernel.
+fn receive_response(stream: &mut UnixStream) {
+    let mut buffer = [0; 2048];
+    match receive_message::<IpcResponse>(stream, &mut buffer) {
+        Ok(Some(IpcResponse::Ok(msg))) => println!(" [KERNEL] OK: {}", msg),
+        Ok(Some(IpcResponse::Error(err))) => println!(" [KERNEL] ERROR: {}", err),
+        Ok(Some(IpcResponse::Value(val))) => println!(" [KERNEL] VALUE: 0x{:02X}", val),
+        Ok(None) => println!(" [!] Connection closed by the kernel."),
+        Err(_) => println!(" [!] Error reading response from kernel."),
     }
 }
 
-fn realizar_exploit(stream: &mut UnixStream) {
-    println!(" [!] Iniciando secuencia de exploit...");
+/// Executes the automated exploit sequence simulating a Null Pointer Dereference
+/// combined with arbitrary execution.
+fn execute_exploit(stream: &mut UnixStream) {
+    println!(" [!] Initiating exploit sequence...");
 
-    // 1. Mapear página cero
-    println!(" [1/3] Mapeando página lógica 0x0...");
-    enviar_comando(stream, "MMAP_LOGICAL 0");
-    recibir_respuesta(stream);
+    // 1. Map logical page zero
+    println!(" [1/3] Mapping logical page 0x0...");
+    let _ = send_message(stream, &IpcRequest::MmapLogical { addr: 0 });
+    receive_response(stream);
 
-    // 2. Inyectar opcode de escalamiento (0xCC = 204)
-    println!(" [2/3] Inyectando payload (0xCC) en memoria física vía MMU...");
-    enviar_comando(stream, "WRITE_LOGICAL 0 0xCC");
-    recibir_respuesta(stream);
+    // 2. Inject shellcode payload (0xCC)
+    println!(" [2/3] Injecting payload (0xCC) into memory...");
+    let _ = send_message(
+        stream,
+        &IpcRequest::WriteLogical {
+            addr: 0,
+            value: 0xCC,
+        },
+    );
+    receive_response(stream);
 
-    // 3. Disparar desreferencia en el Kernel
-    println!(" [3/3] Ejecutando syscall vulnerable (SYS_VULN)...");
-    enviar_comando(stream, "SYS_VULN");
-    recibir_respuesta(stream);
+    // 3. Trigger kernel vulnerability
+    println!(" [3/3] Executing vulnerable syscall (SYS_VULN)...");
+    let _ = send_message(stream, &IpcRequest::SysVuln);
+    receive_response(stream);
 }
