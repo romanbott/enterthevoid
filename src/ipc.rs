@@ -35,7 +35,7 @@ pub fn send_message<T: Serialize>(stream: &mut UnixStream, msg: &T) -> std::io::
 pub fn receive_message<'a, T: Deserialize<'a>>(
     stream: &mut UnixStream,
     buffer: &'a mut [u8],
-) -> std::io::Result<Option<IpcResponse>> {
+) -> std::io::Result<Option<T>> {
     let bytes_read = stream.read(buffer)?;
     if bytes_read == 0 {
         return Ok(None);
